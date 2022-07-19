@@ -11,6 +11,10 @@ type QueryDatacenterOptions struct {
 	// never try a datacenter multiple times, so those are subtracted from
 	// this list before proceeding.
 	Datacenters []string
+
+	// PeerNames is a fixed list of datacenters to try. This field cannot be
+	// populated with NearestN or Datacenters.
+	PeerNames []string
 }
 
 // QueryDNSOptions controls settings when query results are served over DNS.

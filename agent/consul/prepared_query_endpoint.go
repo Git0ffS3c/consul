@@ -187,9 +187,14 @@ func parseService(svc *structs.ServiceQuery) error {
 		return fmt.Errorf("Must provide a Service name to query")
 	}
 
+	failover := svc.Failover
 	// NearestN can be 0 which means "don't fail over by RTT".
-	if svc.Failover.NearestN < 0 {
+	if failover.NearestN < 0 {
 		return fmt.Errorf("Bad NearestN '%d', must be >= 0", svc.Failover.NearestN)
+	}
+
+	if (failover.NearestN != 0 || len(failover.Datacenters) != 0) && len(failover.PeerNames) != 0 {
+		return fmt.Errorf("PeerName cannot be populated with NearestN or Datacenters")
 	}
 
 	// Make sure the metadata filters are valid
@@ -462,7 +467,7 @@ func (p *PreparedQuery) Execute(args *structs.PreparedQueryExecuteRequest,
 	// and bail out. Otherwise, we fail over and try remote DCs, as allowed
 	// by the query setup.
 	if len(reply.Nodes) == 0 {
-		wrapper := &queryServerWrapper{p.srv}
+		wrapper := &queryServerWrapper{srv: p.srv, executeRemote: p.ExecuteRemote}
 		if err := queryFailover(wrapper, query, args, reply); err != nil {
 			return err
 		}
@@ -565,8 +570,13 @@ func (p *PreparedQuery) execute(query *structs.PreparedQuery,
 	reply.Nodes = nodes
 	reply.DNS = query.DNS
 
-	// Stamp the result for this datacenter.
-	reply.Datacenter = p.srv.config.Datacenter
+	// Stamp the result with its this datacenter or peer.
+	if query.Service.PeerName != "" {
+		reply.PeerName = query.Service.PeerName
+		reply.Datacenter = query.Service.PeerName
+	} else {
+		reply.Datacenter = p.srv.config.Datacenter
+	}
 
 	return nil
 }
@@ -652,11 +662,22 @@ type queryServer interface {
 	GetLogger() hclog.Logger
 	GetOtherDatacentersByDistance() ([]string, error)
 	ForwardDC(method, dc string, args interface{}, reply interface{}) error
+	GetDC() string
+	ExecuteRemote(args *structs.PreparedQueryExecuteRemoteRequest, reply *structs.PreparedQueryExecuteResponse) error
 }
 
 // queryServerWrapper applies the queryServer interface to a Server.
 type queryServerWrapper struct {
-	srv *Server
+	srv           *Server
+	executeRemote func(args *structs.PreparedQueryExecuteRemoteRequest, reply *structs.PreparedQueryExecuteResponse) error
+}
+
+func (q *queryServerWrapper) GetDC() string {
+	return q.srv.config.Datacenter
+}
+
+func (q *queryServerWrapper) ExecuteRemote(args *structs.PreparedQueryExecuteRemoteRequest, reply *structs.PreparedQueryExecuteResponse) error {
+	return q.executeRemote(args, reply)
 }
 
 // GetLogger returns the server's logger.
@@ -688,9 +709,25 @@ func (q *queryServerWrapper) ForwardDC(method, dc string, args interface{}, repl
 	return q.srv.forwardDC(method, dc, args, reply)
 }
 
+func (q *queryServerWrapper) CheckConnectServiceNodes(serviceName string, entMeta *acl.EnterpriseMeta, peerName string) (structs.CheckServiceNodes, error) {
+	_, nodes, err := q.srv.fsm.State().CheckConnectServiceNodes(nil, serviceName, entMeta, peerName)
+	return nodes, err
+}
+
+// queryFailover fails over to other peers or datacenters.
+func queryFailover(q queryServer, query *structs.PreparedQuery,
+	args *structs.PreparedQueryExecuteRequest,
+	reply *structs.PreparedQueryExecuteResponse) error {
+	f := queryFailoverDC
+	if len(query.Service.Failover.PeerNames) > 0 {
+		f = queryFailoverPeers
+	}
+	return f(q, query, args, reply)
+}
+
 // queryFailover runs an algorithm to determine which DCs to try and then calls
 // them to try to locate alternative services.
-func queryFailover(q queryServer, query *structs.PreparedQuery,
+func queryFailoverDC(q queryServer, query *structs.PreparedQuery,
 	args *structs.PreparedQueryExecuteRequest,
 	reply *structs.PreparedQueryExecuteResponse) error {
 
@@ -764,6 +801,62 @@ func queryFailover(q queryServer, query *structs.PreparedQuery,
 			Connect:      args.Connect,
 		}
 		if err := q.ForwardDC("PreparedQuery.ExecuteRemote", dc, remote, reply); err != nil {
+			q.GetLogger().Warn("Failed querying for service in datacenter",
+				"service", query.Service.Service,
+				"datacenter", dc,
+				"error", err,
+			)
+			continue
+		}
+
+		// We can stop if we found some nodes.
+		if len(reply.Nodes) > 0 {
+			break
+		}
+	}
+
+	// Set this at the end because the response from the remote doesn't have
+	// this information.
+	reply.Failovers = failovers
+
+	return nil
+}
+
+// queryFailoverPeers makes requests to cluster peers  to try to locate
+// alternative services.
+func queryFailoverPeers(q queryServer, query *structs.PreparedQuery,
+	args *structs.PreparedQueryExecuteRequest,
+	reply *structs.PreparedQueryExecuteResponse) error {
+	dc := q.GetDC()
+	// Try the selected peer names in priority order.
+	failovers := 0
+	for _, peerName := range query.Service.Failover.PeerNames {
+		// This keeps track of how many iterations we actually run.
+		failovers++
+
+		// Be super paranoid and set the nodes slice to nil since it's
+		// the same slice we used before. We know there's nothing in
+		// there, but the underlying msgpack library has a policy of
+		// updating the slice when it's non-nil, and that feels dirty.
+		// Let's just set it to nil so there's no way to communicate
+		// through this slice across successive RPC calls.
+		reply.Nodes = nil
+
+		query.Service.PeerName = peerName
+
+		// Note that we pass along the limit since it can be applied
+		// remotely to save bandwidth. We also pass along the consistency
+		// mode information and token we were given, so that applies to
+		// the remote query as well.
+		remote := &structs.PreparedQueryExecuteRemoteRequest{
+			Datacenter:   dc,
+			Query:        *query,
+			Limit:        args.Limit,
+			QueryOptions: args.QueryOptions,
+			Connect:      args.Connect,
+		}
+		err := q.ExecuteRemote(remote, reply)
+		if err != nil {
 			q.GetLogger().Warn("Failed querying for service in datacenter",
 				"service", query.Service.Service,
 				"datacenter", dc,

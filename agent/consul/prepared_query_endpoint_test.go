@@ -82,8 +82,25 @@ func TestPreparedQuery_Apply(t *testing.T) {
 		t.Fatalf("bad: %v", err)
 	}
 
-	// Fix that and make sure it propagates an error from the Raft apply.
+	// Fix that and ensure PeerNames and NearestN cannot be set at the same time.
+	query.Query.Service.Failover.NearestN = 1
+	query.Query.Service.Failover.PeerNames = []string{"peer"}
+	err = msgpackrpc.CallWithCodec(codec, "PreparedQuery.Apply", &query, &reply)
+	if err == nil || !strings.Contains(err.Error(), "PeerName cannot be populated with") {
+		t.Fatalf("bad: %v", err)
+	}
+
+	// Fix that and ensure PeerNames and Datacenters cannot be set at the same time.
 	query.Query.Service.Failover.NearestN = 0
+	query.Query.Service.Failover.Datacenters = []string{"dc2"}
+	query.Query.Service.Failover.PeerNames = []string{"peer"}
+	err = msgpackrpc.CallWithCodec(codec, "PreparedQuery.Apply", &query, &reply)
+	if err == nil || !strings.Contains(err.Error(), "PeerName cannot be populated with") {
+		t.Fatalf("bad: %v", err)
+	}
+
+	// Fix that and make sure it propagates an error from the Raft apply.
+	query.Query.Service.Failover.PeerNames = nil
 	query.Query.Session = "nope"
 	err = msgpackrpc.CallWithCodec(codec, "PreparedQuery.Apply", &query, &reply)
 	if err == nil || !strings.Contains(err.Error(), "invalid session") {
@@ -2724,7 +2741,9 @@ func TestPreparedQuery_Wrapper(t *testing.T) {
 	joinWAN(t, s2, s1)
 
 	// Try all the operations on a real server via the wrapper.
-	wrapper := &queryServerWrapper{s1}
+	wrapper := &queryServerWrapper{srv: s1, executeRemote: func(args *structs.PreparedQueryExecuteRemoteRequest, reply *structs.PreparedQueryExecuteResponse) error {
+		return nil
+	}}
 	wrapper.GetLogger().Debug("Test")
 
 	ret, err := wrapper.GetOtherDatacentersByDistance()
@@ -2747,6 +2766,7 @@ type mockQueryServer struct {
 	DatacentersError error
 	QueryLog         []string
 	QueryFn          func(dc string, args interface{}, reply interface{}) error
+	PeerQueryFn      func(args *structs.PreparedQueryExecuteRemoteRequest, reply *structs.PreparedQueryExecuteResponse) error
 	Logger           hclog.Logger
 	LogBuffer        *bytes.Buffer
 }
@@ -2768,6 +2788,10 @@ func (m *mockQueryServer) GetLogger() hclog.Logger {
 	return m.Logger
 }
 
+func (m *mockQueryServer) GetDC() string {
+	return "dc1"
+}
+
 func (m *mockQueryServer) GetOtherDatacentersByDistance() ([]string, error) {
 	return m.Datacenters, m.DatacentersError
 }
@@ -2779,6 +2803,15 @@ func (m *mockQueryServer) ForwardDC(method, dc string, args interface{}, reply i
 	}
 	if m.QueryFn != nil {
 		return m.QueryFn(dc, args, reply)
+	}
+	return nil
+}
+
+func (m *mockQueryServer) ExecuteRemote(args *structs.PreparedQueryExecuteRemoteRequest, reply *structs.PreparedQueryExecuteResponse) error {
+	m.QueryLog = append(m.QueryLog, fmt.Sprintf("peer:%s", args.Query.Service.PeerName))
+	reply.PeerName = args.Query.Service.PeerName
+	if m.PeerQueryFn != nil {
+		return m.PeerQueryFn(args, reply)
 	}
 	return nil
 }
@@ -3121,6 +3154,32 @@ func TestPreparedQuery_queryFailover(t *testing.T) {
 			t.Fatalf("bad: %v", reply)
 		}
 		if queries := mock.JoinQueryLog(); queries != "xxx:PreparedQuery.ExecuteRemote" {
+			t.Fatalf("bad: %s", queries)
+		}
+	}
+
+	// Make sure the limit and query options are plumbed through.
+	query.Service.Failover.PeerNames = []string{"cluster-01", "cluster-02"}
+	{
+		mock := &mockQueryServer{
+			PeerQueryFn: func(args *structs.PreparedQueryExecuteRemoteRequest, reply *structs.PreparedQueryExecuteResponse) error {
+				if args.Query.Service.PeerName == "cluster-02" {
+					reply.Nodes = nodes()
+				}
+				return nil
+			},
+		}
+
+		var reply structs.PreparedQueryExecuteResponse
+		if err := queryFailover(mock, query, &structs.PreparedQueryExecuteRequest{}, &reply); err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if len(reply.Nodes) != 3 ||
+			reply.PeerName != "cluster-02" || reply.Failovers != 2 ||
+			!reflect.DeepEqual(reply.Nodes, nodes()) {
+			t.Fatalf("bad: %v", reply)
+		}
+		if queries := mock.JoinQueryLog(); queries != "peer:cluster-01|peer:cluster-02" {
 			t.Fatalf("bad: %s", queries)
 		}
 	}

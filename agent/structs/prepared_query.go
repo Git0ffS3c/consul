@@ -21,6 +21,10 @@ type QueryDatacenterOptions struct {
 	// never try a datacenter multiple times, so those are subtracted from
 	// this list before proceeding.
 	Datacenters []string
+
+	// PeerNames is a fixed list of datacenters to try. This field cannot be
+	// populated with NearestN or Datacenters.
+	PeerNames []string
 }
 
 // QueryDNSOptions controls settings when query results are served over DNS.
@@ -322,6 +326,9 @@ type PreparedQueryExecuteResponse struct {
 
 	// Datacenter is the datacenter that these results came from.
 	Datacenter string
+
+	// PeerName specifies the cluster peer that these results came from.
+	PeerName string
 
 	// Failovers is a count of how many times we had to query a remote
 	// datacenter.
